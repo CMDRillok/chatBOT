@@ -43,6 +43,16 @@ class MainScreen(Screen):
         color: #919191;
         margin-top: 1;
     }
+
+    #recognized-text {
+        dock: bottom;
+        height: 3;
+        width: 100%;
+        padding: 1 2;
+        background: #242424;
+        color: #f5f5f5;
+        border-top: solid #4a4a4a;
+}
     """
 
     def compose(self) -> ComposeResult:
@@ -52,6 +62,7 @@ class MainScreen(Screen):
             yield Button("Включить микрофон", id="mic")
             yield Button("Настройки", id="settings")
             yield Static("Микрофон выключен", id="mic-status")
+            yield Static("Распознанный текст: ", id="recognized-text")
         yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -142,7 +153,7 @@ class MyTUI(App):
 
     def toggle_microphone(self) -> None:
         self.microphone_enabled = not self.microphone_enabled
-
+    
         screen = self.get_screen("main")
         button = screen.query_one("#mic", Button)
         status = screen.query_one("#mic-status", Static)
@@ -153,7 +164,11 @@ class MyTUI(App):
         else:
             button.label = "Включить микрофон"
             status.update("Микрофон выключен")
-
+    
+    def update_recognized_text(self, text: str) -> None:
+        screen = self.get_screen("main")
+        display = screen.query_one("#recognized-text", Static)
+        display.update(f"Распознанный текст: {text}")
 
 if __name__ == "__main__":
     MyTUI().run()
