@@ -1,0 +1,113 @@
+
+
+Screen {
+    background: #1c1c1c;
+    color: #f5f5f5;
+}
+
+Header {
+    background: #242424;
+    color: #f5f5f5;
+}
+
+Footer {
+    background: #242424;
+    color: #919191;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 1 2;
+    background: #1c1c1c;
+}
+
+#chat-layout {
+    height: 1fr;
+}
+
+#status {
+    height: 3;
+    padding: 1;
+    color: #919191;
+    border-bottom: solid #4a4a4a;
+}
+
+#history {
+    height: 1fr;
+    padding: 1 0;
+    overflow-y: auto;
+}
+
+.chat-message {
+    height: auto;
+    min-height: 3;
+    padding: 1;
+    margin-bottom: 1;
+    border-left: thick #919191;
+    background: #242424;
+    color: #f5f5f5;
+}
+
+#empty-state {
+    color: #919191;
+    padding: 1;
+}
+
+#recognized-text {
+    height: 3;
+    padding: 1;
+    color: #919191;
+    border-top: solid #4a4a4a;
+}
+
+#input-row {
+    height: 3;
+    dock: bottom;
+    margin-top: 1;
+}
+
+#question-input {
+    width: 1fr;
+    background: #242424;
+    color: #f5f5f5;
+    border: solid #4a4a4a;
+}
+
+#question-input:focus {
+    border: solid #919191;
+}
+
+Button {
+    margin-left: 1;
+    min-width: 10;
+    background: #242424;
+    color: #f5f5f5;
+    border: solid #4a4a4a;
+}
+
+Button:hover {
+    background: #4a4a4a;
+}
+
+Button:focus {
+    border: solid #f5f5f5;
+}
+
+#settings-layout {
+    height: 1fr;
+    padding: 2;
+}
+
+#settings-layout Label {
+    height: auto;
+    margin-bottom: 2;
+    color: #919191;
+}
+
+#settings-layout Button {
+    margin-top: 1;
+    width: 20;
+}
