@@ -54,3 +54,12 @@ Checkbox { margin-top: 1; margin-bottom: 1; }
 }
 #settings-actions { height: 5; margin-top: 2; margin-bottom: 2; }
 #settings-actions Button { width: auto; min-width: 18; }
+
+#commands-note, #commands-safety-note {
+    color: #919191; height: auto; margin-bottom: 1;
+}
+#voice-commands {
+    height: 16; min-height: 10; border: solid #4a4a4a;
+    background: #242424; color: #f5f5f5;
+}
+#voice-commands:focus { border: solid #919191; }

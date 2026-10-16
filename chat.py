@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import queue
+import shlex
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button, Checkbox, DirectoryTree, Footer, Header, Input, Label,
-    Select, Static, TabbedContent, TabPane,
+    Select, Static, TabbedContent, TabPane, TextArea,
 )
 
 APP_DIR = Path.home() / ".config" / "voice-assistant"
@@ -33,7 +35,11 @@ DEFAULTS: dict[str, Any] = {
     "llm_temperature": 0.7,
     "llm_max_tokens": 512,
     "llm_gpu_layers": 0,
-    "system_prompt": "Ты полезный ассистент для управления пк. отвечай коротко и по делу.",
+    "system_prompt": "Ты полезный ассистент. Отвечай на русском языке, если пользователь не попросил иначе.",
+    "voice_commands": [
+        {"phrases": ["открой браузер", "запусти браузер"], "command": "firefox", "description": "Открыть браузер Firefox"},
+        {"phrases": ["открой телеграм", "запусти телеграм"], "command": "telegram-desktop", "description": "Открыть Telegram Desktop"},
+    ],
 }
 
 
@@ -187,6 +193,24 @@ class VoiceAssistant(App):
                         yield Button("Загрузить Vosk", id="load-vosk")
                         yield Button("Остановить микрофон", id="stop-mic")
 
+                    yield Static("ГОЛОСОВЫЕ КОМАНДЫ", classes="section-title")
+                    yield Static(
+                        'JSON-список команд. У каждой команды есть фразы-триггеры и команда запуска. '
+                        'Пример: {"phrases": ["открой браузер"], "command": "firefox", "description": "Браузер"}.',
+                        id="commands-note",
+                    )
+                    yield TextArea(
+                        json.dumps(self.settings.get("voice_commands", DEFAULTS["voice_commands"]), ensure_ascii=False, indent=2),
+                        id="voice-commands",
+                        language="json",
+                        show_line_numbers=True,
+                    )
+                    yield Static(
+                        "Срабатывает команда, если фраза-триггер содержится в распознанной речи. "
+                        "Запуск выполняется без shell: указывай исполняемую программу и аргументы, например firefox или telegram-desktop.",
+                        id="commands-safety-note",
+                    )
+
                     yield Static("ЛОКАЛЬНАЯ LLM — llama.cpp / GGUF", classes="section-title")
                     yield Label("Файл модели GGUF")
                     with Horizontal(classes="path-row"):
@@ -254,6 +278,25 @@ class VoiceAssistant(App):
             max_tokens = int(self.query_one("#llm-max-tokens", Input).value)
             gpu_layers = int(self.query_one("#llm-gpu-layers", Input).value)
             system_prompt = self.query_one("#system-prompt", Input).value.strip()
+            commands_raw = self.query_one("#voice-commands", TextArea).text
+            voice_commands = json.loads(commands_raw)
+            if not isinstance(voice_commands, list):
+                raise ValueError("Список голосовых команд должен быть JSON-массивом.")
+            for index, item in enumerate(voice_commands, start=1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Команда №{index} должна быть объектом JSON.")
+                phrases = item.get("phrases")
+                command = item.get("command")
+                if not isinstance(phrases, list) or not phrases or not all(isinstance(x, str) and x.strip() for x in phrases):
+                    raise ValueError(f"У команды №{index} должен быть непустой массив phrases.")
+                if not isinstance(command, str) or not command.strip():
+                    raise ValueError(f"У команды №{index} должно быть заполнено поле command.")
+                try:
+                    argv = shlex.split(command)
+                except ValueError as error:
+                    raise ValueError(f"Некорректная команда запуска №{index}: {error}") from error
+                if not argv:
+                    raise ValueError(f"Команда запуска №{index} пустая.")
 
             if vosk_path and not Path(vosk_path).expanduser().is_dir():
                 raise ValueError("Каталог модели Vosk не найден.")
@@ -280,6 +323,7 @@ class VoiceAssistant(App):
                 "llm_max_tokens": max_tokens,
                 "llm_gpu_layers": gpu_layers,
                 "system_prompt": system_prompt or DEFAULTS["system_prompt"],
+                "voice_commands": voice_commands,
             })
             save_settings(self.settings)
             return True
@@ -383,12 +427,16 @@ class VoiceAssistant(App):
         if event.input.id == "question-input":
             self.send_question()
 
-    def send_question(self, question: str | None = None) -> None:
+    def send_question(self, question: str | None = None, *, check_commands: bool = True) -> None:
         input_widget = self.query_one("#question-input", Input)
         question = (question if question is not None else input_widget.value).strip()
         if not question:
             return
         input_widget.value = ""
+        # Route configured commands before sending anything to the LLM.
+        if check_commands and self.try_execute_voice_command(question):
+            input_widget.value = ""
+            return
         self.last_question = question
         self.last_answer = ""
         history = self.query_one("#history", VerticalScroll)
@@ -396,6 +444,49 @@ class VoiceAssistant(App):
         history.mount(Static(f"You: {question}", classes="chat-message"))
         self.set_status("Генерирую ответ локальной LLM…" if self.llm else "LLM не загружена.")
         self.generate_answer(question)
+
+
+    @staticmethod
+    def normalize_command_text(text: str) -> str:
+        """Normalize case and punctuation while preserving word boundaries."""
+        import re
+        normalized = text.casefold().replace("ё", "е")
+        normalized = re.sub(r"[^\w\s-]", " ", normalized, flags=re.UNICODE)
+        return " ".join(normalized.split())
+
+    def try_execute_voice_command(self, phrase: str) -> bool:
+        """Run a matching configured command; return True when a trigger matched."""
+        normalized_phrase = self.normalize_command_text(phrase)
+        if not normalized_phrase:
+            return False
+
+        matches: list[tuple[int, dict[str, Any], str]] = []
+        for item in self.settings.get("voice_commands", []):
+            for trigger in item.get("phrases", []):
+                normalized_trigger = self.normalize_command_text(trigger)
+                if normalized_trigger and normalized_trigger in normalized_phrase:
+                    # Prefer the most specific (longest) trigger if several match.
+                    matches.append((len(normalized_trigger), item, trigger))
+        if not matches:
+            return False
+
+        _, item, trigger = max(matches, key=lambda match: match[0])
+        command_text = str(item.get("command", "")).strip()
+        description = str(item.get("description", "")).strip() or f"Выполняю команду: {command_text}"
+        try:
+            argv = shlex.split(command_text)
+            if not argv:
+                raise ValueError("пустая команда запуска")
+            # Intentionally no shell=True: voice phrases cannot inject shell syntax.
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            self.set_status(f"Голосовая команда выполнена: {description} (триггер: «{trigger}»).")
+            history = self.query_one("#history", VerticalScroll)
+            history.remove_children()
+            history.mount(Static(f"Команда: {description}", classes="chat-message"))
+        except Exception as error:
+            self.set_status(f"Не удалось выполнить команду «{command_text}»: {error}")
+        return True
 
     @work(thread=True)
     def generate_answer(self, question: str) -> None:
@@ -436,8 +527,12 @@ class VoiceAssistant(App):
         )
         if final:
             self.query_one("#question-input", Input).value = text
+            # Voice commands are always checked first, independently of auto-send.
+            if self.try_execute_voice_command(text):
+                self.query_one("#question-input", Input).value = ""
+                return
             if self.settings.get("auto_send", True):
-                self.send_question(text)
+                self.send_question(text, check_commands=False)
 
     def toggle_microphone(self) -> None:
         if self.mic_enabled:
