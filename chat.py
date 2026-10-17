@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import sounddevice as sd
-from vosk import Model as VoskModel, KaldiRecognizer
+from vosk import Model as VoskModel, KaldiRecognizer, SetLogLevel
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -25,6 +25,8 @@ APP_DIR = Path.home() / ".config" / "voice-assistant"
 CONFIG_PATH = APP_DIR / "config.json"
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000  # 250 ms at 16 kHz
+
+SetLogLevel(-1)
 
 DEFAULTS: dict[str, Any] = {
     "vosk_model_path": "",
