@@ -36,6 +36,7 @@ DEFAULTS: dict[str, Any] = {
     "tts_enabled": True,
     "tts_model_path": "",
     "tts_output_device": "auto",
+    "tts_volume": 100,
     "llm_model_path": "",
     "llm_context_size": 4096,
     "llm_temperature": 0.7,
@@ -65,6 +66,15 @@ def save_settings(settings: dict[str, Any]) -> None:
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def scale_pcm16(data: bytes, volume_percent: int) -> bytes:
+    import numpy as np
+
+    if volume_percent >= 100:
+        return data
+    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+    return (samples * (max(0, volume_percent) / 100)).astype(np.int16).tobytes()
 
 
 def resample_pcm16(data: bytes, source_rate: int, target_rate: int) -> bytes:
@@ -322,6 +332,8 @@ class VoiceAssistant(App):
                         id="tts-output",
                         allow_blank=False,
                     )
+                    yield Label("Громкость озвучки (0–100 %)")
+                    yield Input(value=str(self.settings["tts_volume"]), id="tts-volume")
                     yield Static(
                         "Рядом с .onnx должен лежать .onnx.json. Голоса скачиваются командой "
                         "python -m piper.download_voices ru_RU-irina-medium. Синтез идёт локально. "
@@ -418,6 +430,7 @@ class VoiceAssistant(App):
             tts_path = self.query_one("#tts-path", Input).value.strip()
             tts_enabled = self.query_one("#tts-enabled", Checkbox).value
             tts_output = str(self.query_one("#tts-output", Select).value or "auto")
+            tts_volume = int(self.query_one("#tts-volume", Input).value)
             commands_raw = self.query_one("#voice-commands", TextArea).text
             voice_commands = json.loads(commands_raw)
             if not isinstance(voice_commands, list):
@@ -450,6 +463,8 @@ class VoiceAssistant(App):
                     raise ValueError("Рядом с .onnx должен лежать файл .onnx.json.")
             if tts_output not in [v for _, v in self.get_output_device_options()]:
                 raise ValueError("Неизвестное устройство вывода звука.")
+            if not 0 <= tts_volume <= 100:
+                raise ValueError("Громкость озвучки должна быть от 0 до 100.")
             if llm_path and not Path(llm_path).expanduser().is_file():
                 raise ValueError("Файл LLM не найден.")
             if llm_path and Path(llm_path).suffix.lower() != ".gguf":
@@ -478,6 +493,7 @@ class VoiceAssistant(App):
                 "tts_enabled": tts_enabled,
                 "tts_model_path": new_tts_path,
                 "tts_output_device": tts_output,
+                "tts_volume": tts_volume,
                 "llm_model_path": str(Path(llm_path).expanduser()) if llm_path else "",
                 "llm_context_size": context_size,
                 "llm_temperature": temperature,
@@ -770,6 +786,7 @@ class VoiceAssistant(App):
                     break
             if stream is None:
                 raise last_error or RuntimeError("не удалось открыть устройство вывода")
+            audio = scale_pcm16(audio, int(self.settings.get("tts_volume", DEFAULTS["tts_volume"])))
             import numpy as np
 
             samples = np.frombuffer(audio, dtype=np.int16)

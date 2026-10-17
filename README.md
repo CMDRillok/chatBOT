@@ -83,6 +83,7 @@ CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86" \
 | `tts_enabled` | Озвучивать ответы модели | `true` |
 | `tts_model_path` | Путь к голосовой модели Piper (`.onnx`) | — |
 | `tts_output_device` | Устройство вывода: `auto` — системное через сервер звука, иначе имя устройства | `auto` |
+| `tts_volume` | Громкость озвучки в процентах (0–100) | `100` |
 | `system_prompt` | Системная инструкция для LLM | — |
 | `voice_commands` | JSON-список голосовых команд: `phrases`, `command`, `description` | Firefox, Telegram |
 
