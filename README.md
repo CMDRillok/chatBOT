@@ -82,6 +82,7 @@ CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86" \
 | `disable_thinking` | Отключить блок размышлений (`<think>`) у моделей вроде Qwen3 | `true` |
 | `tts_enabled` | Озвучивать ответы модели | `true` |
 | `tts_model_path` | Путь к голосовой модели Piper (`.onnx`) | — |
+| `tts_output_device` | Устройство вывода: `auto` — системное через сервер звука, иначе имя устройства | `auto` |
 | `system_prompt` | Системная инструкция для LLM | — |
 | `voice_commands` | JSON-список голосовых команд: `phrases`, `command`, `description` | Firefox, Telegram |
 

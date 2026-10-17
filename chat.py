@@ -35,6 +35,7 @@ DEFAULTS: dict[str, Any] = {
     "memory_pairs": 3,
     "tts_enabled": True,
     "tts_model_path": "",
+    "tts_output_device": "auto",
     "llm_model_path": "",
     "llm_context_size": 4096,
     "llm_temperature": 0.7,
@@ -314,9 +315,17 @@ class VoiceAssistant(App):
                             id="tts-path",
                         )
                         yield Button("Выбрать…", id="pick-tts")
+                    yield Label("Устройство вывода")
+                    yield Select(
+                        self.get_output_device_options(),
+                        value=self.valid_output_device_value(),
+                        id="tts-output",
+                        allow_blank=False,
+                    )
                     yield Static(
                         "Рядом с .onnx должен лежать .onnx.json. Голоса скачиваются командой "
-                        "python -m piper.download_voices ru_RU-irina-medium. Синтез идёт локально.",
+                        "python -m piper.download_voices ru_RU-irina-medium. Синтез идёт локально. "
+                        "«Системное» направляет звук через сервер (PipeWire/PulseAudio) в устройство по умолчанию.",
                         id="tts-note",
                     )
                     with Horizontal(id="tts-actions"):
@@ -343,6 +352,48 @@ class VoiceAssistant(App):
         valid = [v for _, v in self.get_microphone_options()]
         return value if value in valid else "default"
 
+    @staticmethod
+    def get_output_device_options() -> list[tuple[str, str]]:
+        options = [("Системное (через сервер звука)", "auto")]
+        seen = {"auto"}
+        try:
+            for device in sd.query_devices():
+                name = device["name"]
+                if device["max_output_channels"] > 0 and name not in seen:
+                    seen.add(name)
+                    options.append((name, name))
+        except Exception:
+            pass
+        return options
+
+    def valid_output_device_value(self) -> str:
+        value = str(self.settings.get("tts_output_device", "auto") or "auto")
+        valid = [v for _, v in self.get_output_device_options()]
+        return value if value in valid else "auto"
+
+    @staticmethod
+    def find_output_device(name: str) -> int | None:
+        for index, device in enumerate(sd.query_devices()):
+            if device["name"] == name and device["max_output_channels"] > 0:
+                return index
+        return None
+
+    def tts_output_candidates(self) -> list[tuple[int | None, str]]:
+        choice = str(self.settings.get("tts_output_device", "auto") or "auto")
+        candidates: list[tuple[int | None, str]] = []
+        if choice != "auto":
+            index = self.find_output_device(choice)
+            if index is not None:
+                candidates.append((index, choice))
+        for name in ("pulse", "pipewire", "default"):
+            if name == choice:
+                continue
+            index = self.find_output_device(name)
+            if index is not None:
+                candidates.append((index, name))
+        candidates.append((None, "устройство по умолчанию"))
+        return candidates
+
     def on_mount(self) -> None:
         # Load configured models if their paths are already set.
         if self.settings.get("vosk_model_path"):
@@ -366,6 +417,7 @@ class VoiceAssistant(App):
             system_prompt = self.query_one("#system-prompt", Input).value.strip()
             tts_path = self.query_one("#tts-path", Input).value.strip()
             tts_enabled = self.query_one("#tts-enabled", Checkbox).value
+            tts_output = str(self.query_one("#tts-output", Select).value or "auto")
             commands_raw = self.query_one("#voice-commands", TextArea).text
             voice_commands = json.loads(commands_raw)
             if not isinstance(voice_commands, list):
@@ -396,6 +448,8 @@ class VoiceAssistant(App):
                     raise ValueError("Для Piper выбери файл голоса .onnx.")
                 if not Path(f"{tts_file}.json").is_file():
                     raise ValueError("Рядом с .onnx должен лежать файл .onnx.json.")
+            if tts_output not in [v for _, v in self.get_output_device_options()]:
+                raise ValueError("Неизвестное устройство вывода звука.")
             if llm_path and not Path(llm_path).expanduser().is_file():
                 raise ValueError("Файл LLM не найден.")
             if llm_path and Path(llm_path).suffix.lower() != ".gguf":
@@ -423,6 +477,7 @@ class VoiceAssistant(App):
                 "auto_send": self.query_one("#auto-send", Checkbox).value,
                 "tts_enabled": tts_enabled,
                 "tts_model_path": new_tts_path,
+                "tts_output_device": tts_output,
                 "llm_model_path": str(Path(llm_path).expanduser()) if llm_path else "",
                 "llm_context_size": context_size,
                 "llm_temperature": temperature,
@@ -685,28 +740,36 @@ class VoiceAssistant(App):
             if not chunks or stop.is_set():
                 return
             source = chunks[0]
-            audio = b"".join(chunk.audio_int16_bytes for chunk in chunks)
+            raw = b"".join(chunk.audio_int16_bytes for chunk in chunks)
+            audio = raw
             rate = source.sample_rate
-            device_rate = int(sd.query_devices(kind="output")["default_samplerate"])
-            if device_rate != rate:
-                audio = resample_pcm16(audio, rate, device_rate)
-                rate = device_rate
-            try:
-                stream = sd.OutputStream(
-                    samplerate=rate,
-                    channels=source.sample_channels,
-                    dtype="int16",
-                )
-            except sd.PortAudioError:
-                if rate == source.sample_rate:
-                    raise
-                audio = resample_pcm16(audio, rate, source.sample_rate)
-                rate = source.sample_rate
-                stream = sd.OutputStream(
-                    samplerate=rate,
-                    channels=source.sample_channels,
-                    dtype="int16",
-                )
+            last_error = None
+            for device, _label in self.tts_output_candidates():
+                if stop.is_set():
+                    return
+                info = sd.query_devices(device, kind="output")
+                device_rate = int(info["default_samplerate"])
+                attempts = [(raw, source.sample_rate)]
+                if device_rate != source.sample_rate:
+                    attempts.append((resample_pcm16(raw, source.sample_rate, device_rate), device_rate))
+                for attempt_audio, attempt_rate in attempts:
+                    try:
+                        stream = sd.OutputStream(
+                            device=device,
+                            samplerate=attempt_rate,
+                            channels=source.sample_channels,
+                            dtype="int16",
+                        )
+                    except sd.PortAudioError as error:
+                        last_error = error
+                        continue
+                    audio = attempt_audio
+                    rate = attempt_rate
+                    break
+                if stream is not None:
+                    break
+            if stream is None:
+                raise last_error or RuntimeError("не удалось открыть устройство вывода")
             import numpy as np
 
             samples = np.frombuffer(audio, dtype=np.int16)
