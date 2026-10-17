@@ -36,7 +36,8 @@ DEFAULTS: dict[str, Any] = {
     "llm_temperature": 0.7,
     "llm_max_tokens": 512,
     "llm_gpu_layers": 20,
-    "system_prompt": "Ты полезный ассистент. Отвечай на русском языке, если пользователь не попросил иначе.",
+    "disable_thinking": True,
+    "system_prompt": "Ты полезный ассистент. Отвечай на русском языке кратко и по существу.",
     "voice_commands": [
         {"phrases": ["открой браузер", "запусти браузер"], "command": "firefox", "description": "Открыть браузер Firefox"},
         {"phrases": ["открой телеграм", "запусти телеграм"], "command": "telegram-desktop", "description": "Открыть Telegram Desktop"},
@@ -59,6 +60,34 @@ def save_settings(settings: dict[str, Any]) -> None:
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def apply_no_think_handler(llm) -> bool:
+    """Force the model to skip its reasoning block when the chat template supports it."""
+    from llama_cpp.llama_chat_format import (
+        Jinja2ChatFormatter,
+        chat_formatter_to_chat_completion_handler,
+    )
+
+    template = llm.metadata.get("tokenizer.chat_template")
+    if not template:
+        return False
+    eos_id = llm.token_eos()
+    bos_id = llm.token_bos()
+    eos_token = llm.detokenize([eos_id], special=True).decode("utf-8", "replace") if eos_id != -1 else ""
+    bos_token = llm.detokenize([bos_id], special=True).decode("utf-8", "replace") if bos_id != -1 else ""
+    formatter = Jinja2ChatFormatter(
+        template=template,
+        eos_token=eos_token,
+        bos_token=bos_token,
+        stop_token_ids=[eos_id] if eos_id != -1 else None,
+    )
+
+    def no_think_formatter(**kwargs):
+        return formatter(enable_thinking=False, **kwargs)
+
+    llm.chat_handler = chat_formatter_to_chat_completion_handler(no_think_formatter)
+    return True
 
 
 class FilePicker(ModalScreen[str | None]):
@@ -232,6 +261,11 @@ class VoiceAssistant(App):
                     yield Input(value=str(self.settings["memory_pairs"]), id="memory-pairs")
                     yield Label("Слои на GPU (0 = только CPU)")
                     yield Input(value=str(self.settings["llm_gpu_layers"]), id="llm-gpu-layers")
+                    yield Checkbox(
+                        "Отключить размышления модели (think) — отвечает быстрее",
+                        value=bool(self.settings["disable_thinking"]),
+                        id="disable-thinking",
+                    )
                     yield Label("Системный промпт")
                     yield Input(value=str(self.settings["system_prompt"]), id="system-prompt")
                     yield Static(
@@ -244,7 +278,6 @@ class VoiceAssistant(App):
                         yield Button("Выгрузить LLM", id="unload-llm")
                     with Horizontal(id="settings-actions"):
                         yield Button("Сохранить настройки", id="save-settings", variant="primary")
-                        yield Button("В чат", id="back-chat")
         yield Footer()
 
     @staticmethod
@@ -282,6 +315,7 @@ class VoiceAssistant(App):
             max_tokens = int(self.query_one("#llm-max-tokens", Input).value)
             memory_pairs = int(self.query_one("#memory-pairs", Input).value)
             gpu_layers = int(self.query_one("#llm-gpu-layers", Input).value)
+            disable_thinking = self.query_one("#disable-thinking", Checkbox).value
             system_prompt = self.query_one("#system-prompt", Input).value.strip()
             commands_raw = self.query_one("#voice-commands", TextArea).text
             voice_commands = json.loads(commands_raw)
@@ -330,6 +364,7 @@ class VoiceAssistant(App):
                 "llm_max_tokens": max_tokens,
                 "memory_pairs": memory_pairs,
                 "llm_gpu_layers": gpu_layers,
+                "disable_thinking": disable_thinking,
                 "system_prompt": system_prompt or DEFAULTS["system_prompt"],
                 "voice_commands": voice_commands,
             })
@@ -367,8 +402,6 @@ class VoiceAssistant(App):
             self.set_status("LLM выгружена из памяти.")
         elif button_id == "stop-mic":
             self.stop_microphone()
-        elif button_id == "back-chat":
-            self.query_one(TabbedContent).active = "chat"
 
     def open_picker(self, target: str) -> None:
         field_id = "vosk-path" if target == "vosk" else "llm-path"
@@ -422,6 +455,8 @@ class VoiceAssistant(App):
                 n_gpu_layers=int(settings["llm_gpu_layers"]),
                 verbose=False,
             )
+            if settings.get("disable_thinking", True):
+                apply_no_think_handler(llm)
             self.call_from_thread(self.llm_model_loaded, llm)
         except Exception as error:
             self.call_from_thread(self.set_status, f"Ошибка загрузки LLM: {error}")
