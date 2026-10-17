@@ -33,6 +33,8 @@ DEFAULTS: dict[str, Any] = {
     "microphone": "default",
     "auto_send": True,
     "memory_pairs": 3,
+    "tts_enabled": True,
+    "tts_model_path": "",
     "llm_model_path": "",
     "llm_context_size": 4096,
     "llm_temperature": 0.7,
@@ -62,6 +64,18 @@ def save_settings(settings: dict[str, Any]) -> None:
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def resample_pcm16(data: bytes, source_rate: int, target_rate: int) -> bytes:
+    import numpy as np
+
+    samples = np.frombuffer(data, dtype=np.int16)
+    if samples.size == 0:
+        return b""
+    length = max(1, int(samples.size * target_rate / source_rate))
+    positions = np.linspace(0, samples.size - 1, length)
+    resampled = np.interp(positions, np.arange(samples.size), samples).astype(np.int16)
+    return resampled.tobytes()
 
 
 def apply_no_think_handler(llm) -> bool:
@@ -167,6 +181,8 @@ class VoiceAssistant(App):
         ("ctrl+2", "show_settings", "Настройки"),
     ]
 
+    PICKER_FIELDS = {"vosk": "vosk-path", "llm": "llm-path", "tts": "tts-path"}
+
     def __init__(self) -> None:
         super().__init__()
         self.settings = load_settings()
@@ -177,6 +193,11 @@ class VoiceAssistant(App):
         self.last_question = ""
         self.last_answer = ""
         self.conversation_history: list[dict[str, str]] = []
+        self.tts_voice = None
+        self._tts_loaded_path = ""
+        self._tts_stop = threading.Event()
+        self._tts_stream = None
+        self._tts_lock = threading.Lock()
         self._vosk_loading = False
         self._llm_loading = False
         self._llm_lock = threading.Lock()
@@ -278,6 +299,30 @@ class VoiceAssistant(App):
                     with Horizontal(id="llm-actions"):
                         yield Button("Загрузить LLM", id="load-llm")
                         yield Button("Выгрузить LLM", id="unload-llm")
+
+                    yield Static("ОЗВУЧКА ОТВЕТОВ — PIPER TTS", classes="section-title")
+                    yield Checkbox(
+                        "Озвучивать ответы модели",
+                        value=bool(self.settings["tts_enabled"]),
+                        id="tts-enabled",
+                    )
+                    yield Label("Файл голосовой модели (.onnx)")
+                    with Horizontal(classes="path-row"):
+                        yield Input(
+                            value=str(self.settings["tts_model_path"]),
+                            placeholder="~/Downloads/ru_RU-irina-medium.onnx",
+                            id="tts-path",
+                        )
+                        yield Button("Выбрать…", id="pick-tts")
+                    yield Static(
+                        "Рядом с .onnx должен лежать .onnx.json. Голоса скачиваются командой "
+                        "python -m piper.download_voices ru_RU-irina-medium. Синтез идёт локально.",
+                        id="tts-note",
+                    )
+                    with Horizontal(id="tts-actions"):
+                        yield Button("Проверить голос", id="test-tts")
+                        yield Button("Стоп", id="stop-tts")
+
                     with Horizontal(id="settings-actions"):
                         yield Button("Сохранить настройки", id="save-settings", variant="primary")
         yield Footer()
@@ -319,6 +364,8 @@ class VoiceAssistant(App):
             gpu_layers = int(self.query_one("#llm-gpu-layers", Input).value)
             disable_thinking = self.query_one("#disable-thinking", Checkbox).value
             system_prompt = self.query_one("#system-prompt", Input).value.strip()
+            tts_path = self.query_one("#tts-path", Input).value.strip()
+            tts_enabled = self.query_one("#tts-enabled", Checkbox).value
             commands_raw = self.query_one("#voice-commands", TextArea).text
             voice_commands = json.loads(commands_raw)
             if not isinstance(voice_commands, list):
@@ -341,6 +388,14 @@ class VoiceAssistant(App):
 
             if vosk_path and not Path(vosk_path).expanduser().is_dir():
                 raise ValueError("Каталог модели Vosk не найден.")
+            tts_file = Path(tts_path).expanduser() if tts_path else None
+            if tts_enabled:
+                if tts_file is None or not tts_file.is_file():
+                    raise ValueError("Файл голосовой модели TTS не найден.")
+                if tts_file.suffix.lower() != ".onnx":
+                    raise ValueError("Для Piper выбери файл голоса .onnx.")
+                if not Path(f"{tts_file}.json").is_file():
+                    raise ValueError("Рядом с .onnx должен лежать файл .onnx.json.")
             if llm_path and not Path(llm_path).expanduser().is_file():
                 raise ValueError("Файл LLM не найден.")
             if llm_path and Path(llm_path).suffix.lower() != ".gguf":
@@ -356,10 +411,18 @@ class VoiceAssistant(App):
             if not 0 <= gpu_layers <= 200:
                 raise ValueError("Число GPU-слоёв должно быть от 0 до 200.")
 
+            new_tts_path = str(tts_file) if tts_file else ""
+            if new_tts_path != self.settings.get("tts_model_path"):
+                self.tts_voice = None
+                self._tts_loaded_path = ""
+            if not tts_enabled:
+                self.stop_tts()
             self.settings.update({
                 "vosk_model_path": str(Path(vosk_path).expanduser()) if vosk_path else "",
                 "microphone": self.query_one("#microphone", Select).value,
                 "auto_send": self.query_one("#auto-send", Checkbox).value,
+                "tts_enabled": tts_enabled,
+                "tts_model_path": new_tts_path,
                 "llm_model_path": str(Path(llm_path).expanduser()) if llm_path else "",
                 "llm_context_size": context_size,
                 "llm_temperature": temperature,
@@ -387,6 +450,13 @@ class VoiceAssistant(App):
             self.open_picker("vosk")
         elif button_id == "pick-llm":
             self.open_picker("llm")
+        elif button_id == "pick-tts":
+            self.open_picker("tts")
+        elif button_id == "test-tts":
+            if self.save_form_to_settings():
+                self.speak_text("Привет! Это проверка голоса ассистента.", force=True)
+        elif button_id == "stop-tts":
+            self.stop_tts()
         elif button_id == "save-settings":
             if self.save_form_to_settings():
                 self.set_status(f"Настройки сохранены: {CONFIG_PATH}")
@@ -406,7 +476,7 @@ class VoiceAssistant(App):
             self.stop_microphone()
 
     def open_picker(self, target: str) -> None:
-        field_id = "vosk-path" if target == "vosk" else "llm-path"
+        field_id = self.PICKER_FIELDS[target]
         current = self.query_one(f"#{field_id}", Input).value.strip() or str(Path.home())
         self.push_screen(
             FilePicker(current, purpose=target),
@@ -416,8 +486,7 @@ class VoiceAssistant(App):
     def apply_picked_path(self, target: str, path: str | None) -> None:
         if not path:
             return
-        field_id = "vosk-path" if target == "vosk" else "llm-path"
-        self.query_one(f"#{field_id}", Input).value = path
+        self.query_one(f"#{self.PICKER_FIELDS[target]}", Input).value = path
 
     @work(thread=True, exclusive=True)
     def load_vosk_model(self) -> None:
@@ -581,6 +650,89 @@ class VoiceAssistant(App):
             Static(f"Assistant: {answer}", classes="chat-message")
         )
         self.set_status("Готово. Можно задать следующий вопрос.")
+        if question:
+            self.speak_text(answer)
+
+    def load_tts_voice(self, model_path: str):
+        with self._tts_lock:
+            if self.tts_voice is not None and self._tts_loaded_path == model_path:
+                return self.tts_voice
+            from piper import PiperVoice
+
+            voice = PiperVoice.load(model_path)
+            self.tts_voice = voice
+            self._tts_loaded_path = model_path
+            return voice
+
+    def stop_tts(self) -> None:
+        self._tts_stop.set()
+
+    @work(thread=True, exclusive=True, group="tts")
+    def speak_text(self, text: str, force: bool = False) -> None:
+        if not force and not self.settings.get("tts_enabled", DEFAULTS["tts_enabled"]):
+            return
+        model_path = str(self.settings.get("tts_model_path", "")).strip()
+        if not model_path:
+            self.call_from_thread(self.set_status, "TTS: укажи файл голосовой модели .onnx в настройках.")
+            return
+        stop = threading.Event()
+        self._tts_stop.set()
+        self._tts_stop = stop
+        stream = None
+        try:
+            voice = self.load_tts_voice(model_path)
+            chunks = [chunk for chunk in voice.synthesize(text)]
+            if not chunks or stop.is_set():
+                return
+            source = chunks[0]
+            audio = b"".join(chunk.audio_int16_bytes for chunk in chunks)
+            rate = source.sample_rate
+            device_rate = int(sd.query_devices(kind="output")["default_samplerate"])
+            if device_rate != rate:
+                audio = resample_pcm16(audio, rate, device_rate)
+                rate = device_rate
+            try:
+                stream = sd.OutputStream(
+                    samplerate=rate,
+                    channels=source.sample_channels,
+                    dtype="int16",
+                )
+            except sd.PortAudioError:
+                if rate == source.sample_rate:
+                    raise
+                audio = resample_pcm16(audio, rate, source.sample_rate)
+                rate = source.sample_rate
+                stream = sd.OutputStream(
+                    samplerate=rate,
+                    channels=source.sample_channels,
+                    dtype="int16",
+                )
+            import numpy as np
+
+            samples = np.frombuffer(audio, dtype=np.int16)
+            self._tts_stream = stream
+            stream.start()
+            step = max(1, rate // 10)
+            for offset in range(0, samples.size, step):
+                if stop.is_set():
+                    break
+                stream.write(samples[offset:offset + step])
+        except Exception as error:
+            self.call_from_thread(self.set_status, f"Ошибка TTS: {error}")
+        finally:
+            self._tts_stream = None
+            if stream is not None:
+                try:
+                    if stop.is_set():
+                        stream.abort()
+                    else:
+                        stream.stop()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
     def set_recognized_text(self, text: str, final: bool = False) -> None:
         self.query_one("#recognized-text", Static).update(

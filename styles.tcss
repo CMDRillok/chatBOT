@@ -46,10 +46,10 @@ Select {
 Checkbox { margin-top: 1; margin-bottom: 1; }
 .path-row { height: 3; margin-bottom: 1; }
 .path-row Input { width: 1fr; }
-#vosk-note, #llm-note {
+#vosk-note, #llm-note, #tts-note {
     color: #919191; height: auto; margin-bottom: 1;
 }
-#vosk-actions, #llm-actions {
+#vosk-actions, #llm-actions, #tts-actions {
     height: 3; margin-top: 1; margin-bottom: 1;
 }
 #settings-actions { height: 5; margin-top: 2; margin-bottom: 2; }
