@@ -30,11 +30,12 @@ DEFAULTS: dict[str, Any] = {
     "vosk_model_path": "",
     "microphone": "default",
     "auto_send": True,
+    "memory_pairs": 3,
     "llm_model_path": "",
     "llm_context_size": 4096,
     "llm_temperature": 0.7,
     "llm_max_tokens": 512,
-    "llm_gpu_layers": 0,
+    "llm_gpu_layers": 20,
     "system_prompt": "Ты полезный ассистент. Отвечай на русском языке, если пользователь не попросил иначе.",
     "voice_commands": [
         {"phrases": ["открой браузер", "запусти браузер"], "command": "firefox", "description": "Открыть браузер Firefox"},
@@ -144,6 +145,7 @@ class VoiceAssistant(App):
         self.audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=100)
         self.last_question = ""
         self.last_answer = ""
+        self.conversation_history: list[dict[str, str]] = []
         self._vosk_loading = False
         self._llm_loading = False
         self._llm_lock = threading.Lock()
@@ -155,7 +157,7 @@ class VoiceAssistant(App):
                 with Vertical(id="chat-layout"):
                     yield Static("Загрузи модель Vosk в настройках.", id="status")
                     with VerticalScroll(id="history"):
-                        yield Static("Скажи вопрос в микрофон или введи его ниже.", id="empty-state")
+                        yield Static("Скажи вопрос в микрофон или введи его ниже.", classes="empty-state")
                     yield Static("Распознанный текст: —", id="recognized-text")
                     with Horizontal(id="input-row"):
                         yield Input(placeholder="Введи вопрос…", id="question-input")
@@ -226,6 +228,8 @@ class VoiceAssistant(App):
                     yield Input(value=str(self.settings["llm_temperature"]), id="llm-temperature")
                     yield Label("Максимум новых токенов")
                     yield Input(value=str(self.settings["llm_max_tokens"]), id="llm-max-tokens")
+                    yield Label("Пар сообщений в памяти (0 — не помнить историю)")
+                    yield Input(value=str(self.settings["memory_pairs"]), id="memory-pairs")
                     yield Label("Слои на GPU (0 = только CPU)")
                     yield Input(value=str(self.settings["llm_gpu_layers"]), id="llm-gpu-layers")
                     yield Label("Системный промпт")
@@ -276,6 +280,7 @@ class VoiceAssistant(App):
             context_size = int(self.query_one("#llm-context", Input).value)
             temperature = float(self.query_one("#llm-temperature", Input).value)
             max_tokens = int(self.query_one("#llm-max-tokens", Input).value)
+            memory_pairs = int(self.query_one("#memory-pairs", Input).value)
             gpu_layers = int(self.query_one("#llm-gpu-layers", Input).value)
             system_prompt = self.query_one("#system-prompt", Input).value.strip()
             commands_raw = self.query_one("#voice-commands", TextArea).text
@@ -310,6 +315,8 @@ class VoiceAssistant(App):
                 raise ValueError("Температура должна быть от 0 до 2.")
             if not 1 <= max_tokens <= 32768:
                 raise ValueError("Максимум токенов должен быть от 1 до 32768.")
+            if not 0 <= memory_pairs <= 50:
+                raise ValueError("Память должна быть от 0 до 50 пар сообщений.")
             if not 0 <= gpu_layers <= 200:
                 raise ValueError("Число GPU-слоёв должно быть от 0 до 200.")
 
@@ -321,10 +328,12 @@ class VoiceAssistant(App):
                 "llm_context_size": context_size,
                 "llm_temperature": temperature,
                 "llm_max_tokens": max_tokens,
+                "memory_pairs": memory_pairs,
                 "llm_gpu_layers": gpu_layers,
                 "system_prompt": system_prompt or DEFAULTS["system_prompt"],
                 "voice_commands": voice_commands,
             })
+            self.trim_conversation_history()
             save_settings(self.settings)
             return True
         except (ValueError, TypeError) as error:
@@ -443,7 +452,7 @@ class VoiceAssistant(App):
         history.remove_children()
         history.mount(Static(f"You: {question}", classes="chat-message"))
         self.set_status("Генерирую ответ локальной LLM…" if self.llm else "LLM не загружена.")
-        self.generate_answer(question)
+        self.generate_answer(question, list(self.conversation_history))
 
 
     @staticmethod
@@ -489,7 +498,7 @@ class VoiceAssistant(App):
         return True
 
     @work(thread=True)
-    def generate_answer(self, question: str) -> None:
+    def generate_answer(self, question: str, history: list[dict[str, str]]) -> None:
         llm = self.llm
         if llm is None:
             self.call_from_thread(
@@ -503,19 +512,34 @@ class VoiceAssistant(App):
                 result = llm.create_chat_completion(
                     messages=[
                         {"role": "system", "content": settings["system_prompt"]},
+                        *history,
                         {"role": "user", "content": question},
                     ],
                     temperature=float(settings["llm_temperature"]),
                     max_tokens=int(settings["llm_max_tokens"]),
                 )
             answer = result["choices"][0]["message"]["content"].strip()
-            self.call_from_thread(self.show_answer, answer or "(Модель вернула пустой ответ.)")
+            if answer:
+                self.call_from_thread(self.show_answer, answer, question)
+            else:
+                self.call_from_thread(self.show_answer, "(Модель вернула пустой ответ.)")
         except Exception as error:
             self.call_from_thread(self.set_status, f"Ошибка LLM: {error}")
             self.call_from_thread(self.show_answer, f"Ошибка генерации: {error}")
 
-    def show_answer(self, answer: str) -> None:
+    def trim_conversation_history(self) -> None:
+        max_messages = max(0, int(self.settings.get("memory_pairs", DEFAULTS["memory_pairs"]))) * 2
+        if max_messages:
+            del self.conversation_history[:-max_messages]
+        else:
+            self.conversation_history.clear()
+
+    def show_answer(self, answer: str, question: str | None = None) -> None:
         self.last_answer = answer
+        if question:
+            self.conversation_history.append({"role": "user", "content": question})
+            self.conversation_history.append({"role": "assistant", "content": answer})
+            self.trim_conversation_history()
         self.query_one("#history", VerticalScroll).mount(
             Static(f"Assistant: {answer}", classes="chat-message")
         )
@@ -611,9 +635,10 @@ class VoiceAssistant(App):
     def action_clear_chat(self) -> None:
         history = self.query_one("#history", VerticalScroll)
         history.remove_children()
-        history.mount(Static("История очищена", id="empty-state"))
+        history.mount(Static("История очищена", classes="empty-state"))
         self.last_question = ""
         self.last_answer = ""
+        self.conversation_history.clear()
 
     def action_show_chat(self) -> None:
         self.query_one(TabbedContent).active = "chat"
