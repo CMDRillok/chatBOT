@@ -1,3 +1,7 @@
+# Copyright (C) 2026 CMDR illok 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# https://github.com/CMDRillok
+
 #!/usr/bin/env bash
 set -euo pipefail
 
