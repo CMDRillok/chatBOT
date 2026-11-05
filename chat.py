@@ -1,3 +1,6 @@
+# Copyright (C) 2026 CMDR illok 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# https://github.com/CMDRillok
 
 from __future__ import annotations
 
